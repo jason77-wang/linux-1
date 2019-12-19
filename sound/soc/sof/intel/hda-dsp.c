@@ -17,6 +17,7 @@
 
 #include <sound/hdaudio_ext.h>
 #include <sound/hda_register.h>
+#include "../sof-audio.h"
 #include "../ops.h"
 #include "hda.h"
 #include "hda-ipc.h"
@@ -474,33 +475,31 @@ int hda_dsp_set_power_state(struct snd_sof_dev *sdev,
 /*
  * Audio DSP states may transform as below:-
  *
- *                                         D0I3 compatible stream
- *     Runtime    +---------------------+   opened only, timeout
+ *                                         Opportunistic D0I3 in S0
+ *     Runtime    +---------------------+  Delayed D0i3 work timeout
  *     suspend    |                     +--------------------+
- *   +------------+       D0(active)    |                    |
+ *   +------------+       D0I0(active)  |                    |
  *   |            |                     <---------------+    |
- *   |   +-------->                     |               |    |
- *   |   |Runtime +--^--+---------^--+--+ The last      |    |
- *   |   |resume     |  |         |  |    opened D0I3   |    |
- *   |   |           |  |         |  |    compatible    |    |
- *   |   |     resume|  |         |  |    stream closed |    |
- *   |   |      from |  | D3      |  |                  |    |
- *   |   |       D3  |  |suspend  |  | d0i3             |    |
+ *   |   +-------->                     |    New IPC	|    |
+ *   |   |Runtime +--^--+---------^--+--+ (via mailbox)	|    |
+ *   |   |resume     |  |         |  |			|    |
+ *   |   |           |  |         |  |			|    |
+ *   |   |     System|  |         |  |			|    |
+ *   |   |     resume|  | S3/S0IX |  |                  |    |
+ *   |   |	     |  | suspend |  | S0IX             |    |
  *   |   |           |  |         |  |suspend           |    |
  *   |   |           |  |         |  |                  |    |
  *   |   |           |  |         |  |                  |    |
  * +-v---+-----------+--v-------+ |  |           +------+----v----+
  * |                            | |  +----------->                |
- * |       D3 (suspended)       | |              |      D0I3      +-----+
- * |                            | +--------------+                |     |
- * |                            |  resume from   |                |     |
- * +-------------------^--------+  d0i3 suspend  +----------------+     |
- *                     |                                                |
- *                     |                       D3 suspend               |
- *                     +------------------------------------------------+
+ * |       D3 (suspended)       | |              |      D0I3      |
+ * |                            | +--------------+                |
+ * |                            |  System resume |                |
+ * +----------------------------+		 +----------------+
  *
- * d0i3_suspend = s0_suspend && D0I3 stream opened,
- * D3 suspend = !d0i3_suspend,
+ * S0IX suspend: The DSP is in D0I3 if any D0I3-compatible streams
+ *		 ignored the suspend trigger. Otherwise the DSP
+ *		 is in D3.
  */
 
 static int hda_suspend(struct snd_sof_dev *sdev, bool runtime_suspend)
@@ -616,6 +615,7 @@ int hda_dsp_resume(struct snd_sof_dev *sdev)
 
 	/* resume from D0I3 */
 	if (sdev->dsp_power_state.state == SOF_DSP_PM_D0) {
+		hda_codec_i915_display_power(sdev, true);
 		/* Set DSP power state */
 		ret = hda_dsp_set_power_state(sdev, &target_state);
 		if (ret < 0) {
@@ -624,8 +624,6 @@ int hda_dsp_resume(struct snd_sof_dev *sdev)
 			return ret;
 		}
 
-	if (sdev->system_suspend_target == SOF_SUSPEND_S0IX) {
-		hda_codec_i915_display_power(sdev, true);
 		/* restore L1SEN bit */
 		if (hda->l1_support_changed)
 			snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
@@ -702,9 +700,21 @@ int hda_dsp_suspend(struct snd_sof_dev *sdev, u32 target_state)
 	};
 	int ret;
 
-	if (sdev->system_suspend_target == SOF_SUSPEND_S0IX) {
+	/* cancel any attempt for DSP D0I3 */
+	cancel_delayed_work_sync(&hda->d0i3_work);
+
+	if (target_state == SOF_DSP_PM_D0) {
 		/* we can't keep a wakeref to display driver at suspend */
 		hda_codec_i915_display_power(sdev, false);
+
+		/* Set DSP power state */
+		ret = hda_dsp_set_power_state(sdev, &target_dsp_state);
+		if (ret < 0) {
+			dev_err(sdev->dev, "error: setting dsp state %d substate %d\n",
+				target_dsp_state.state,
+				target_dsp_state.substate);
+			return ret;
+		}
 
 		/* enable L1SEN to make sure the system can enter S0Ix */
 		hda->l1_support_changed =
@@ -771,4 +781,34 @@ int hda_dsp_set_hw_params_upon_resume(struct snd_sof_dev *sdev)
 	}
 #endif
 	return 0;
+}
+
+void hda_dsp_d0i3_work(struct work_struct *work)
+{
+	struct sof_intel_hda_dev *hdev = container_of(work,
+						      struct sof_intel_hda_dev,
+						      d0i3_work.work);
+	struct hdac_bus *bus = &hdev->hbus.core;
+	struct snd_sof_dev *sdev = dev_get_drvdata(bus->dev);
+	struct sof_dsp_power_state target_state;
+	int ret;
+
+	target_state.state = SOF_DSP_PM_D0;
+
+	/* DSP can enter D0I3 iff only D0I3-compatible streams are active */
+	if (snd_sof_dsp_only_d0i3_compatible_stream_active(sdev))
+		target_state.substate = SOF_HDA_DSP_PM_D0I3;
+	else
+		target_state.substate = SOF_HDA_DSP_PM_D0I0;
+
+	/* remain in D0I0 */
+	if (target_state.substate == SOF_HDA_DSP_PM_D0I0)
+		return;
+
+	/* This can fail but error cannot be propagated */
+	ret = hda_dsp_set_power_state(sdev, &target_state);
+	if (ret < 0)
+		dev_err_ratelimited(sdev->dev,
+				    "error: failed to set DSP state %d substate %d\n",
+				    target_state.state, target_state.substate);
 }
