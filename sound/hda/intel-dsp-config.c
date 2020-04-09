@@ -338,16 +338,19 @@ int snd_intel_dsp_driver_probe(struct pci_dev *pci)
 
 	/* find the configuration for the specific device */
 	cfg = snd_intel_dsp_find_config(pci, config_table, ARRAY_SIZE(config_table));
+	printk("wwwwwwwwwwwwwwww11111111\n");
 	if (!cfg)
 		return SND_INTEL_DSP_DRIVER_ANY;
-
+	printk("wwwwwwwwwwwwwwww1111111122222222\n");
 	if (cfg->flags & FLAG_SOF) {
 		if (cfg->flags & FLAG_SOF_ONLY_IF_DMIC) {
+				printk("wwwwwwwwwwwwwwww1111111133333333\n");
 			if (snd_intel_dsp_check_dmic(pci)) {
 				dev_info(&pci->dev, "Digital mics found on Skylake+ platform, using SOF driver\n");
 				return SND_INTEL_DSP_DRIVER_SOF;
 			}
 		} else {
+				printk("wwwwwwwwwwwwwwww11111111444444444\n");
 			return SND_INTEL_DSP_DRIVER_SOF;
 		}
 	}
